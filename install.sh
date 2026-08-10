@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# 阿里云 IPv6 DDNS 一键部署安装脚本
+# 阿里云 IPv6 DDNS 一键部署安装脚本 (修复交互版)
 # ==========================================
 
 GREEN="\033[32m"
@@ -24,7 +24,6 @@ echo -e "${GREEN}==========================================${PLAIN}"
 # ------------------------------------------
 echo -e "\n${YELLOW}[1/5] 正在检查依赖软件...${PLAIN}"
 
-# 识别包管理器
 if command -v apt-get &>/dev/null; then
     PM="apt-get"
 elif command -v dnf &>/dev/null; then
@@ -36,14 +35,12 @@ else
     exit 1
 fi
 
-# 检查基础软件
 if ! command -v python3 &>/dev/null || ! command -v pip3 &>/dev/null; then
     echo -e "正在补全基础环境 (python3, pip3, cron)..."
     $PM update -y
     $PM install -y python3 python3-pip cron || $PM install -y python3 python3-pip crontabs
 fi
 
-# 检查 Python 阿里云 SDK 模块
 if ! python3 -c "import alibabacloud_alidns20150109, alibabacloud_tea_openapi" &>/dev/null; then
     echo -e "正在安装阿里云 SDK 依赖库..."
     pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi --break-system-packages &>/dev/null \
@@ -53,18 +50,35 @@ fi
 echo -e "${GREEN}✓ 基础依赖检查完成！${PLAIN}"
 
 # ------------------------------------------
-# 步骤 2：检查网卡环境与交互选择
+# 步骤 2：检查网卡环境与交互选择 (修复未检测到时的退路)
 # ------------------------------------------
 echo -e "\n${YELLOW}[2/5] 正在扫描具备公网 IPv6 的网卡...${PLAIN}"
 
-# 提取有公网 IPv6 地址 (2xxx/3xxx 开头) 的网卡列表
 mapfile -t IF_LIST < <(ip -6 addr show scope global | grep -E "inet6 (2|3)" | awk '{print $NF}' | sort -u)
 
 SELECTED_IF=""
 
 if [ ${#IF_LIST[@]} -eq 0 ]; then
     echo -e "${RED}警告：系统未自动匹配到 2xxx/3xxx 开头的公网 IPv6 地址！${PLAIN}"
-    read -rp "请手动输入需要绑定的网卡名称 (例如 ens32 或 eth0): " SELECTED_IF
+    echo -e "可能当前网卡尚未获取到公网 IPv6，或使用非标准前缀。"
+    echo -e "以下为系统检测到的所有本地物理网卡："
+    
+    # 获取系统所有非 loopback 网卡
+    mapfile -t ALL_IFS < <(ip -o link show | awk -F': ' '{print $2}' | grep -v "lo")
+    for i in "${!ALL_IFS[@]}"; do
+        echo -e "  $((i+1))) ${ALL_IFS[$i]}"
+    done
+
+    while [ -z "$SELECTED_IF" ]; do
+        read -rp "请选择序号或直接输入网卡名称 (如 ens32/eth0): " INPUT_IF < /dev/tty
+        if [[ "$INPUT_IF" =~ ^[0-9]+$ ]] && [ "$INPUT_IF" -ge 1 ] && [ "$INPUT_IF" -le "${#ALL_IFS[@]}" ]; then
+            SELECTED_IF="${ALL_IFS[$((INPUT_IF-1))]}"
+        elif [ -n "$INPUT_IF" ]; then
+            SELECTED_IF="$INPUT_IF"
+        else
+            echo -e "${RED}错误：网卡名称不能为空，请重新输入！${PLAIN}"
+        fi
+    done
 elif [ ${#IF_LIST[@]} -eq 1 ]; then
     SELECTED_IF="${IF_LIST[0]}"
     echo -e "自动绑定唯一可用公网 IPv6 网卡: ${GREEN}${SELECTED_IF}${PLAIN}"
@@ -74,7 +88,7 @@ else
         echo -e "  $((i+1))) ${IF_LIST[$i]}"
     done
     while true; do
-        read -rp "请选择绑定的网卡编号 [1-${#IF_LIST[@]}]: " CHOICE
+        read -rp "请选择绑定的网卡编号 [1-${#IF_LIST[@]}]: " CHOICE < /dev/tty
         if [[ "$CHOICE" =~ ^[0-9]+$ ]] && [ "$CHOICE" -ge 1 ] && [ "$CHOICE" -le "${#IF_LIST[@]}" ]; then
             SELECTED_IF="${IF_LIST[$((CHOICE-1))]}"
             break
@@ -87,14 +101,30 @@ fi
 echo -e "最终选择绑定网卡: ${GREEN}${SELECTED_IF}${PLAIN}"
 
 # ------------------------------------------
-# 步骤 3：交互设置阿里云 DNS 配置并保存
+# 步骤 3：交互设置阿里云 DNS 配置 (加入非空强校验)
 # ------------------------------------------
 echo -e "\n${YELLOW}[3/5] 配置阿里云 API 信息与域名参数...${PLAIN}"
 
-read -rp "请输入 AccessKey ID: " AK_ID
-read -rp "请输入 AccessKey Secret: " AK_SECRET
-read -rp "请输入主域名 (例如 example.com): " DOMAIN
-read -rp "请输入主机记录 RR (例如 @ 或 www, 默认 @): " RR
+AK_ID=""
+AK_SECRET=""
+DOMAIN=""
+
+while [ -z "$AK_ID" ]; do
+    read -rp "请输入 AccessKey ID: " AK_ID < /dev/tty
+    [ -z "$AK_ID" ] && echo -e "${RED}AccessKey ID 不能为空！${PLAIN}"
+done
+
+while [ -z "$AK_SECRET" ]; do
+    read -rp "请输入 AccessKey Secret: " AK_SECRET < /dev/tty
+    [ -z "$AK_SECRET" ] && echo -e "${RED}AccessKey Secret 不能为空！${PLAIN}"
+done
+
+while [ -z "$DOMAIN" ]; do
+    read -rp "请输入主域名 (例如 example.com): " DOMAIN < /dev/tty
+    [ -z "$DOMAIN" ] && echo -e "${RED}主域名不能为空！${PLAIN}"
+done
+
+read -rp "请输入主机记录 RR (例如 @ 或 www, 默认 @): " RR < /dev/tty
 RR=${RR:-@}
 
 mkdir -p /etc/alidns
@@ -217,12 +247,12 @@ def main():
     interface = cfg.get("INTERFACE", DEFAULT_INTERFACE)
 
     if not ak_id or not ak_secret or not domain:
-        log.error("缺少必要配置参数！")
+        log.error("缺少必要配置参数！请检查 /etc/alidns/credentials 配置。")
         sys.exit(1)
 
     current_ipv6 = get_ipv6(interface=interface)
     if not current_ipv6:
-        log.error(f"无法获取有效公网 IPv6 地址")
+        log.error(f"无法在网卡 [{interface}] 或公网 API 获取有效 IPv6 地址")
         sys.exit(1)
 
     log.info(f"获取公网 IPv6 地址成功: {current_ipv6} (网卡: {interface})")
@@ -281,7 +311,8 @@ echo "3) 每 72 小时自动执行"
 echo "4) 每 96 小时自动执行"
 echo "5) 每 10 分钟自动执行 (推荐：防止家宽 IPv6 变动导致较长断网)"
 
-read -rp "请选择定时选项 [1-5]: " CRON_CHOICE
+CRON_CHOICE=""
+read -rp "请选择定时选项 [1-5]: " CRON_CHOICE < /dev/tty
 
 case $CRON_CHOICE in
     1) CRON_EXPR="0 0 * * *" ;;
@@ -292,10 +323,7 @@ case $CRON_CHOICE in
     *) CRON_EXPR="0 0 * * *" ;;
 esac
 
-# 移出已存在的同类型 cron 任务，避免重复写入
 (crontab -l 2>/dev/null | grep -v "/etc/alidns/alidns-ipv6-ddns.py") | crontab -
-
-# 写入新的 cron 表达式
 (crontab -l 2>/dev/null; echo "${CRON_EXPR} /usr/bin/python3 /etc/alidns/alidns-ipv6-ddns.py >/dev/null 2>&1") | crontab -
 
 echo -e "${GREEN}✓ Cron 定时任务添加成功，表达式: [ ${CRON_EXPR} ]${PLAIN}"

@@ -22,7 +22,7 @@ echo -e "${GREEN}==========================================${PLAIN}"
 # ------------------------------------------
 # 步骤 1：检查并安装系统与 Python 依赖
 # ------------------------------------------
-echo -e "\n${YELLOW}[1/5] 正在检查依赖软件...${PLAIN}"
+echo -e "\n${YELLOW}[1/6] 正在检查依赖软件...${PLAIN}"
 
 if command -v apt-get &>/dev/null; then
     PM="apt-get"
@@ -52,7 +52,7 @@ echo -e "${GREEN}✓ 基础依赖检查完成！${PLAIN}"
 # ------------------------------------------
 # 步骤 2：检查网卡环境与交互选择 (修复未检测到时的退路)
 # ------------------------------------------
-echo -e "\n${YELLOW}[2/5] 正在扫描具备公网 IPv6 的网卡...${PLAIN}"
+echo -e "\n${YELLOW}[2/6] 正在扫描具备公网 IPv6 的网卡...${PLAIN}"
 
 mapfile -t IF_LIST < <(ip -6 addr show scope global | grep -E "inet6 (2|3)" | awk '{print $NF}' | sort -u)
 
@@ -103,7 +103,7 @@ echo -e "最终选择绑定网卡: ${GREEN}${SELECTED_IF}${PLAIN}"
 # ------------------------------------------
 # 步骤 3：交互设置阿里云 DNS 配置 (加入非空强校验)
 # ------------------------------------------
-echo -e "\n${YELLOW}[3/5] 配置阿里云 API 信息与域名参数...${PLAIN}"
+echo -e "\n${YELLOW}[3/6] 配置阿里云 API 信息与域名参数...${PLAIN}"
 
 AK_ID=""
 AK_SECRET=""
@@ -143,7 +143,7 @@ echo -e "${GREEN}✓ 配置文件已保存至 /etc/alidns/credentials (安全权
 # ------------------------------------------
 # 步骤 4：部署 Python DDNS 核心代码
 # ------------------------------------------
-echo -e "\n${YELLOW}[4/5] 正在落地核心脚本 /etc/alidns/alidns-ipv6-ddns.py ...${PLAIN}"
+echo -e "\n${YELLOW}[4/6] 正在落地核心脚本 /etc/alidns/alidns-ipv6-ddns.py ...${PLAIN}"
 
 cat << 'EOF' > /etc/alidns/alidns-ipv6-ddns.py
 #!/usr/bin/env python3
@@ -302,31 +302,117 @@ chmod +x /etc/alidns/alidns-ipv6-ddns.py
 echo -e "${GREEN}✓ 脚本部署完成：/etc/alidns/alidns-ipv6-ddns.py${PLAIN}"
 
 # ------------------------------------------
-# 步骤 5：设定 Cron 定时任务
+# 步骤 5：配置 IPv6 变动实时监听服务 (systemd)
 # ------------------------------------------
-echo -e "\n${YELLOW}[5/5] 设置定时任务执行频率...${PLAIN}"
-echo "1) 每 24 小时自动执行"
-echo "2) 每 48 小时自动执行"
-echo "3) 每 72 小时自动执行"
-echo "4) 每 96 小时自动执行"
-echo "5) 每 10 分钟自动执行 (推荐：防止家宽 IPv6 变动导致较长断网)"
+echo -e "\n${YELLOW}[5/6] 配置 IPv6 变动实时监听服务 (systemd 守护进程)...${PLAIN}"
+echo -e "开启后将利用内核 Netlink 事件实时监听 IPv6 变动，一旦发生改变将在数秒内立刻触发 DNS 更新。"
+
+ENABLE_SYSTEMD=""
+read -rp "是否开启 systemd 实时监听服务? [Y/n] (默认 Y): " ENABLE_SYSTEMD < /dev/tty
+ENABLE_SYSTEMD=${ENABLE_SYSTEMD:-Y}
+
+if [[ "$ENABLE_SYSTEMD" =~ ^[Yy]$ ]]; then
+    if ! command -v systemctl &>/dev/null; then
+        echo -e "${YELLOW}提示：当前环境未检测到 systemctl 命令，跳过 systemd 守护进程配置。${PLAIN}"
+    else
+        cat << 'EOF' > /etc/alidns/alidns-monitor.sh
+#!/usr/bin/env bash
+
+TARGET_SCRIPT="/etc/alidns/alidns-ipv6-ddns.py"
+PYTHON_BIN="$(command -v python3 || echo /usr/bin/python3)"
+CRED_FILE="/etc/alidns/credentials"
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] 启动 IPv6 变动内核事件监听服务..."
+
+INTERFACE=""
+if [ -f "$CRED_FILE" ]; then
+    INTERFACE=$(grep "^INTERFACE=" "$CRED_FILE" | cut -d'=' -f2 | tr -d ' "\r')
+fi
+
+MONITOR_CMD=(ip -6 monitor address)
+if [ -n "$INTERFACE" ]; then
+    MONITOR_CMD+=(dev "$INTERFACE")
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 监听网卡: $INTERFACE"
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] 监听所有网卡"
+fi
+
+"${MONITOR_CMD[@]}" | while read -r line; do
+    # 只要包含全球单播前缀 (2xxx 或 3xxx)，说明公网 IPv6 发生增删变动
+    if echo "$line" | grep -qE "inet6 (2|3)"; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 检测到 IPv6 地址变动: $line"
+
+        # 防抖：等待 3 秒等待网络配置稳定，合并瞬时多次事件
+        sleep 3
+        # 丢弃缓冲队列中因同一次重拨产生的多余通知
+        while read -t 1 -r _; do :; done
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 触发 DDNS 记录更新..."
+        $PYTHON_BIN "$TARGET_SCRIPT"
+    fi
+done
+EOF
+        chmod +x /etc/alidns/alidns-monitor.sh
+
+        cat << 'EOF' > /etc/systemd/system/alidns-monitor.service
+[Unit]
+Description=Aliyun IPv6 DDNS Realtime Monitor Service
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /etc/alidns/alidns-monitor.sh
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload
+        systemctl enable --now alidns-monitor.service
+        echo -e "${GREEN}✓ systemd 实时监听服务已启动并设为开机自启 (alidns-monitor.service)${PLAIN}"
+    fi
+fi
+
+# ------------------------------------------
+# 步骤 6：设定 Cron 定时任务
+# ------------------------------------------
+echo -e "\n${YELLOW}[6/6] 设置 Cron 定时任务执行频率 (用于周期性保底检查)...${PLAIN}"
+echo "1) 每 10 分钟自动执行 (推荐：防止漏触发)"
+echo "2) 每 24 小时自动执行"
+echo "3) 每 48 小时自动执行"
+echo "4) 每 72 小时自动执行"
+echo "5) 每 96 小时自动执行"
+echo "6) 不配置 Cron 任务"
 
 CRON_CHOICE=""
-read -rp "请选择定时选项 [1-5]: " CRON_CHOICE < /dev/tty
+read -rp "请选择定时选项 [1-6] (默认 1): " CRON_CHOICE < /dev/tty
+CRON_CHOICE=${CRON_CHOICE:-1}
 
+CRON_EXPR=""
 case $CRON_CHOICE in
-    1) CRON_EXPR="0 0 * * *" ;;
-    2) CRON_EXPR="0 0 */2 * * *" ;;
-    3) CRON_EXPR="0 0 */3 * * *" ;;
-    4) CRON_EXPR="0 0 */4 * * *" ;;
-    5) CRON_EXPR="*/10 * * * *" ;;
-    *) CRON_EXPR="0 0 * * *" ;;
+    1) CRON_EXPR="*/10 * * * *" ;;
+    2) CRON_EXPR="0 0 * * *" ;;
+    3) CRON_EXPR="0 0 */2 * *" ;;
+    4) CRON_EXPR="0 0 */3 * *" ;;
+    5) CRON_EXPR="0 0 */4 * *" ;;
+    6) CRON_EXPR="" ;;
+    *) CRON_EXPR="*/10 * * * *" ;;
 esac
 
-(crontab -l 2>/dev/null | grep -v "/etc/alidns/alidns-ipv6-ddns.py") | crontab -
-(crontab -l 2>/dev/null; echo "${CRON_EXPR} /usr/bin/python3 /etc/alidns/alidns-ipv6-ddns.py >/dev/null 2>&1") | crontab -
+PYTHON_BIN="$(command -v python3 || echo /usr/bin/python3)"
 
-echo -e "${GREEN}✓ Cron 定时任务添加成功，表达式: [ ${CRON_EXPR} ]${PLAIN}"
+# 清洗旧的定时条目，防止重复
+(crontab -l 2>/dev/null | grep -v "/etc/alidns/alidns-ipv6-ddns.py") | crontab -
+
+if [ -n "$CRON_EXPR" ]; then
+    (crontab -l 2>/dev/null; echo "${CRON_EXPR} ${PYTHON_BIN} /etc/alidns/alidns-ipv6-ddns.py >/dev/null 2>&1") | crontab -
+    echo -e "${GREEN}✓ Cron 定时任务添加成功，表达式: [ ${CRON_EXPR} ]${PLAIN}"
+else
+    echo -e "${YELLOW}已跳过 Cron 定时任务设置。${PLAIN}"
+fi
 
 # ------------------------------------------
 # 部署完成并尝试首次运行测试
@@ -335,7 +421,10 @@ echo -e "\n${GREEN}==========================================${PLAIN}"
 echo -e "${GREEN}      部署全部完成！正在执行首次测试...     ${PLAIN}"
 echo -e "${GREEN}==========================================${PLAIN}\n"
 
-python3 /etc/alidns/alidns-ipv6-ddns.py
+$PYTHON_BIN /etc/alidns/alidns-ipv6-ddns.py
 
-echo -e "\n如需手动执行，可运行: ${YELLOW}python3 /etc/alidns/alidns-ipv6-ddns.py${PLAIN}"
+echo -e "\n如需手动执行，可运行: ${YELLOW}${PYTHON_BIN} /etc/alidns/alidns-ipv6-ddns.py${PLAIN}"
 echo -e "日志查看路径: ${YELLOW}/var/log/alidns-ipv6-ddns.log${PLAIN}"
+if command -v systemctl &>/dev/null && systemctl is-active --quiet alidns-monitor.service 2>/dev/null; then
+    echo -e "实时监听状态: ${GREEN}运行中 (可通过 journalctl -u alidns-monitor -f 查看实时变动)${PLAIN}"
+fi

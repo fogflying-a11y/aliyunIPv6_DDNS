@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 
 # ==========================================
-# 阿里云 IPv6 DDNS 一键部署安装脚本 (修复交互版)
+# 阿里云 / Cloudflare IPv6 DDNS 一键部署安装脚本
 # ==========================================
 
 GREEN="\033[32m"
@@ -15,9 +15,9 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
-echo -e "${GREEN}==========================================${PLAIN}"
-echo -e "${GREEN}    开始部署 阿里云 IPv6 DDNS 自动化服务    ${PLAIN}"
-echo -e "${GREEN}==========================================${PLAIN}"
+echo -e "${GREEN}================================================${PLAIN}"
+echo -e "${GREEN}  开始部署 阿里云 / Cloudflare IPv6 DDNS 服务   ${PLAIN}"
+echo -e "${GREEN}================================================${PLAIN}"
 
 # ------------------------------------------
 # 步骤 1：检查并安装系统与 Python 依赖
@@ -39,12 +39,6 @@ if ! command -v python3 &>/dev/null || ! command -v pip3 &>/dev/null; then
     echo -e "正在补全基础环境 (python3, pip3, cron)..."
     $PM update -y
     $PM install -y python3 python3-pip cron || $PM install -y python3 python3-pip crontabs
-fi
-
-if ! python3 -c "import alibabacloud_alidns20150109, alibabacloud_tea_openapi" &>/dev/null; then
-    echo -e "正在安装阿里云 SDK 依赖库..."
-    pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi --break-system-packages &>/dev/null \
-    || pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi
 fi
 
 echo -e "${GREEN}✓ 基础依赖检查完成！${PLAIN}"
@@ -101,39 +95,112 @@ fi
 echo -e "最终选择绑定网卡: ${GREEN}${SELECTED_IF}${PLAIN}"
 
 # ------------------------------------------
-# 步骤 3：交互设置阿里云 DNS 配置 (加入非空强校验)
+# 步骤 3：交互设置 DNS 服务商与凭证配置
 # ------------------------------------------
-echo -e "\n${YELLOW}[3/6] 配置阿里云 API 信息与域名参数...${PLAIN}"
+echo -e "\n${YELLOW}[3/6] 配置 DNS 服务商与域名参数...${PLAIN}"
+echo "请选择要启用的 DNS 动态解析服务："
+echo "  1) 阿里云 DNS"
+echo "  2) Cloudflare DNS"
+echo "  3) 同时启用 (阿里云 + Cloudflare 双解析)"
 
+DNS_PROVIDER=""
+while true; do
+    read -rp "请选择 [1-3] (默认 3): " DNS_PROVIDER < /dev/tty
+    DNS_PROVIDER=${DNS_PROVIDER:-3}
+    if [[ "$DNS_PROVIDER" =~ ^[1-3]$ ]]; then
+        break
+    fi
+    echo -e "${RED}输入无效，请输入 1、2 或 3！${PLAIN}"
+done
+
+ENABLE_ALIDNS="false"
+ENABLE_CLOUDFLARE="false"
+
+case $DNS_PROVIDER in
+    1) ENABLE_ALIDNS="true" ;;
+    2) ENABLE_CLOUDFLARE="true" ;;
+    3) ENABLE_ALIDNS="true"; ENABLE_CLOUDFLARE="true" ;;
+esac
+
+# 阿里云配置
 AK_ID=""
 AK_SECRET=""
-DOMAIN=""
+ALI_DOMAIN=""
+ALI_RR="@"
 
-while [ -z "$AK_ID" ]; do
-    read -rp "请输入 AccessKey ID: " AK_ID < /dev/tty
-    [ -z "$AK_ID" ] && echo -e "${RED}AccessKey ID 不能为空！${PLAIN}"
-done
+if [ "$ENABLE_ALIDNS" = "true" ]; then
+    echo -e "\n${YELLOW}--- [配置 阿里云 DNS] ---${PLAIN}"
+    if ! python3 -c "import alibabacloud_alidns20150109, alibabacloud_tea_openapi" &>/dev/null; then
+        echo -e "正在安装阿里云 SDK 依赖库..."
+        pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi --break-system-packages &>/dev/null \
+        || pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi
+    fi
+    while [ -z "$AK_ID" ]; do
+        read -rp "请输入 阿里云 AccessKey ID: " AK_ID < /dev/tty
+        [ -z "$AK_ID" ] && echo -e "${RED}AccessKey ID 不能为空！${PLAIN}"
+    done
 
-while [ -z "$AK_SECRET" ]; do
-    read -rp "请输入 AccessKey Secret: " AK_SECRET < /dev/tty
-    [ -z "$AK_SECRET" ] && echo -e "${RED}AccessKey Secret 不能为空！${PLAIN}"
-done
+    while [ -z "$AK_SECRET" ]; do
+        read -rp "请输入 阿里云 AccessKey Secret: " AK_SECRET < /dev/tty
+        [ -z "$AK_SECRET" ] && echo -e "${RED}AccessKey Secret 不能为空！${PLAIN}"
+    done
 
-while [ -z "$DOMAIN" ]; do
-    read -rp "请输入主域名 (例如 example.com): " DOMAIN < /dev/tty
-    [ -z "$DOMAIN" ] && echo -e "${RED}主域名不能为空！${PLAIN}"
-done
+    while [ -z "$ALI_DOMAIN" ]; do
+        read -rp "请输入 阿里云 主域名 (例如 example.com): " ALI_DOMAIN < /dev/tty
+        [ -z "$ALI_DOMAIN" ] && echo -e "${RED}主域名不能为空！${PLAIN}"
+    done
 
-read -rp "请输入主机记录 RR (例如 @ 或 www, 默认 @): " RR < /dev/tty
-RR=${RR:-@}
+    read -rp "请输入 阿里云 主机记录 RR (例如 @ 或 www, 默认 @): " ALI_RR < /dev/tty
+    ALI_RR=${ALI_RR:-@}
+fi
+
+# Cloudflare 配置
+CF_TOKEN=""
+CF_DOMAIN=""
+CF_RR="@"
+CF_PROXIED="false"
+
+if [ "$ENABLE_CLOUDFLARE" = "true" ]; then
+    echo -e "\n${YELLOW}--- [配置 Cloudflare DNS] ---${PLAIN}"
+    echo -e "提示：请使用具备 [Zone - DNS - Edit] 权限的 API Token（安全推荐）"
+    while [ -z "$CF_TOKEN" ]; do
+        read -rp "请输入 Cloudflare API Token: " CF_TOKEN < /dev/tty
+        [ -z "$CF_TOKEN" ] && echo -e "${RED}API Token 不能为空！${PLAIN}"
+    done
+
+    while [ -z "$CF_DOMAIN" ]; do
+        read -rp "请输入 Cloudflare 主域名 (Zone名称，如 example.com): " CF_DOMAIN < /dev/tty
+        [ -z "$CF_DOMAIN" ] && echo -e "${RED}主域名不能为空！${PLAIN}"
+    done
+
+    read -rp "请输入 Cloudflare 主机记录 RR (例如 @ 或 www, 默认 @): " CF_RR < /dev/tty
+    CF_RR=${CF_RR:-@}
+
+    read -rp "是否开启 Cloudflare CDN 代理(小黄云 Proxy)? [y/N] (默认 N 关闭以保证直连): " CF_PROXY_INPUT < /dev/tty
+    if [[ "$CF_PROXY_INPUT" =~ ^[Yy]$ ]]; then
+        CF_PROXIED="true"
+        echo -e "Cloudflare 代理状态: ${GREEN}已开启 (Proxied)${PLAIN}"
+    else
+        CF_PROXIED="false"
+        echo -e "Cloudflare 代理状态: ${YELLOW}已关闭 (DNS Only 直连)${PLAIN}"
+    fi
+fi
 
 mkdir -p /etc/alidns
 
 cat <<EOF > /etc/alidns/credentials
+ENABLE_ALIDNS=${ENABLE_ALIDNS}
 ALIBABA_CLOUD_AK_ID=${AK_ID}
 ALIBABA_CLOUD_AK_SECRET=${AK_SECRET}
-DOMAIN=${DOMAIN}
-RR=${RR}
+DOMAIN=${ALI_DOMAIN}
+RR=${ALI_RR}
+
+ENABLE_CLOUDFLARE=${ENABLE_CLOUDFLARE}
+CF_API_TOKEN=${CF_TOKEN}
+CF_DOMAIN=${CF_DOMAIN}
+CF_RR=${CF_RR}
+CF_PROXIED=${CF_PROXIED}
+
 INTERFACE=${SELECTED_IF}
 EOF
 
@@ -149,17 +216,16 @@ cat << 'EOF' > /etc/alidns/alidns-ipv6-ddns.py
 #!/usr/bin/env python3
 """
 alidns-ipv6-ddns.py
-阿里云 DNS IPv6 (AAAA) 动态解析更新脚本
+阿里云 / Cloudflare IPv6 (AAAA) 动态解析更新脚本 (支持双解析)
 """
+import json
 import logging
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.parse
 import urllib.request
-
-from alibabacloud_alidns20150109.client import Client as DnsClient
-from alibabacloud_alidns20150109 import models as dns_models
-from alibabacloud_tea_openapi import models as open_api_models
 
 CREDENTIALS_FILE = "/etc/alidns/credentials"
 TTL = 600
@@ -230,24 +296,176 @@ def get_ipv6(interface=DEFAULT_INTERFACE):
             continue
     return ""
 
-def create_client(ak_id, ak_secret):
-    config = open_api_models.Config(
-        access_key_id=ak_id,
-        access_key_secret=ak_secret,
-        endpoint="alidns.aliyuncs.com",
-    )
-    return DnsClient(config)
+# ==========================================
+# 阿里云 DNS 更新模块
+# ==========================================
+def sync_aliyun(ak_id, ak_secret, domain, rr, current_ipv6):
+    try:
+        from alibabacloud_alidns20150109.client import Client as DnsClient
+        from alibabacloud_alidns20150109 import models as dns_models
+        from alibabacloud_tea_openapi import models as open_api_models
+    except ImportError:
+        log.error("[Aliyun] 缺少阿里云 SDK，请安装: pip3 install alibabacloud_alidns20150109 alibabacloud_tea_openapi")
+        return False
+
+    sub_domain = f"{rr}.{domain}" if rr != "@" else domain
+    log.info(f"[Aliyun] 正在检查解析记录: {sub_domain} (AAAA)")
+
+    try:
+        config = open_api_models.Config(
+            access_key_id=ak_id,
+            access_key_secret=ak_secret,
+            endpoint="alidns.aliyuncs.com",
+        )
+        client = DnsClient(config)
+        request = dns_models.DescribeSubDomainRecordsRequest(sub_domain=sub_domain, type="AAAA")
+        resp = client.describe_sub_domain_records(request)
+        records = resp.body.domain_records.record if resp.body.domain_records else []
+    except Exception as e:
+        log.error(f"[Aliyun] 查询 DNS 解析失败: {e}")
+        return False
+
+    if records:
+        record = records[0]
+        if record.value == current_ipv6:
+            log.info(f"[Aliyun] DNS 记录未发生改变 [{sub_domain} AAAA {current_ipv6}]，跳过更新")
+            return True
+        log.info(f"[Aliyun] 更新解析: {sub_domain} AAAA {record.value} -> {current_ipv6}")
+        try:
+            update_req = dns_models.UpdateDomainRecordRequest(
+                record_id=record.record_id, rr=rr, type="AAAA", value=current_ipv6, ttl=TTL
+            )
+            client.update_domain_record(update_req)
+            log.info("[Aliyun] DNS 更新成功 ✓")
+            return True
+        except Exception as e:
+            log.error(f"[Aliyun] 更新失败: {e}")
+            return False
+    else:
+        log.info(f"[Aliyun] 创建解析: {sub_domain} AAAA {current_ipv6}")
+        try:
+            add_req = dns_models.AddDomainRecordRequest(
+                domain_name=domain, rr=rr, type="AAAA", value=current_ipv6, ttl=TTL
+            )
+            resp = client.add_domain_record(add_req)
+            log.info(f"[Aliyun] DNS 创建成功 ✓ RecordId: {resp.body.record_id}")
+            return True
+        except Exception as e:
+            log.error(f"[Aliyun] 创建失败: {e}")
+            return False
+
+# ==========================================
+# Cloudflare DNS 更新模块 (内置 REST API)
+# ==========================================
+def cf_api_request(method, endpoint, token, data=None):
+    url = f"https://api.cloudflare.com/client/v4{endpoint}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "User-Agent": "alidns-cf-ipv6-ddns/1.0"
+    }
+    body = json.dumps(data).encode("utf-8") if data else None
+    req = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err_msg = e.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTP {e.code}: {err_msg}")
+    except Exception as e:
+        raise RuntimeError(str(e))
+
+def get_cf_zone_id(token, zone_name):
+    query = urllib.parse.urlencode({"name": zone_name, "status": "active"})
+    res = cf_api_request("GET", f"/zones?{query}", token)
+    if not res.get("success") or not res.get("result"):
+        raise RuntimeError(f"未找到域名 {zone_name} 对应的 Zone ID，请确认 Token 权限或域名是否正确")
+    return res["result"][0]["id"]
+
+def sync_cloudflare(token, zone_name, rr, current_ipv6, proxied=False):
+    full_domain = zone_name if rr in ("@", "") else f"{rr}.{zone_name}"
+    log.info(f"[Cloudflare] 正在检查解析记录: {full_domain} (AAAA)")
+
+    try:
+        zone_id = get_cf_zone_id(token, zone_name)
+    except Exception as e:
+        log.error(f"[Cloudflare] 获取 Zone ID 失败: {e}")
+        return False
+
+    try:
+        query = urllib.parse.urlencode({"type": "AAAA", "name": full_domain})
+        res = cf_api_request("GET", f"/zones/{zone_id}/dns_records?{query}", token)
+        records = res.get("result", []) if res.get("success") else []
+    except Exception as e:
+        log.error(f"[Cloudflare] 查询 DNS 解析记录失败: {e}")
+        return False
+
+    if records:
+        record = records[0]
+        rec_id = record["id"]
+        old_ip = record.get("content", "")
+        old_proxied = record.get("proxied", False)
+
+        if old_ip == current_ipv6 and old_proxied == proxied:
+            log.info(f"[Cloudflare] DNS 记录未发生改变 [{full_domain} AAAA {current_ipv6} proxied={proxied}]，跳过更新")
+            return True
+
+        log.info(f"[Cloudflare] 更新解析: {full_domain} AAAA {old_ip} -> {current_ipv6} (proxied={proxied})")
+        payload = {
+            "type": "AAAA",
+            "name": full_domain,
+            "content": current_ipv6,
+            "ttl": 1 if proxied else TTL,
+            "proxied": proxied
+        }
+        try:
+            cf_api_request("PUT", f"/zones/{zone_id}/dns_records/{rec_id}", token, payload)
+            log.info("[Cloudflare] DNS 更新成功 ✓")
+            return True
+        except Exception as e:
+            log.error(f"[Cloudflare] 更新失败: {e}")
+            return False
+    else:
+        log.info(f"[Cloudflare] 创建解析: {full_domain} AAAA {current_ipv6} (proxied={proxied})")
+        payload = {
+            "type": "AAAA",
+            "name": full_domain,
+            "content": current_ipv6,
+            "ttl": 1 if proxied else TTL,
+            "proxied": proxied
+        }
+        try:
+            cf_api_request("POST", f"/zones/{zone_id}/dns_records", token, payload)
+            log.info("[Cloudflare] DNS 创建成功 ✓")
+            return True
+        except Exception as e:
+            log.error(f"[Cloudflare] 创建失败: {e}")
+            return False
 
 def main():
     cfg = load_config()
-    ak_id = cfg.get("ALIBABA_CLOUD_AK_ID", "")
-    ak_secret = cfg.get("ALIBABA_CLOUD_AK_SECRET", "")
-    domain = cfg.get("DOMAIN", "")
-    rr = cfg.get("RR", "@")
     interface = cfg.get("INTERFACE", DEFAULT_INTERFACE)
 
-    if not ak_id or not ak_secret or not domain:
-        log.error("缺少必要配置参数！请检查 /etc/alidns/credentials 配置。")
+    # 阿里云配置
+    enable_ali = cfg.get("ENABLE_ALIDNS", "false").lower() == "true"
+    ak_id = cfg.get("ALIBABA_CLOUD_AK_ID", "")
+    ak_secret = cfg.get("ALIBABA_CLOUD_AK_SECRET", "")
+    ali_domain = cfg.get("DOMAIN", "")
+    ali_rr = cfg.get("RR", "@")
+
+    # Cloudflare 配置
+    enable_cf = cfg.get("ENABLE_CLOUDFLARE", "false").lower() == "true"
+    cf_token = cfg.get("CF_API_TOKEN", "")
+    cf_domain = cfg.get("CF_DOMAIN", "")
+    cf_rr = cfg.get("CF_RR", "@")
+    cf_proxied = cfg.get("CF_PROXIED", "false").lower() == "true"
+
+    # 兼容历史无 ENABLE_* 标志但有旧配置的情况
+    if not enable_ali and not enable_cf and ak_id and ak_secret and ali_domain:
+        enable_ali = True
+
+    if not enable_ali and not enable_cf:
+        log.error("未启用任何 DNS 服务商，请检查 /etc/alidns/credentials 配置！")
         sys.exit(1)
 
     current_ipv6 = get_ipv6(interface=interface)
@@ -256,43 +474,26 @@ def main():
         sys.exit(1)
 
     log.info(f"获取公网 IPv6 地址成功: {current_ipv6} (网卡: {interface})")
-    client = create_client(ak_id, ak_secret)
-    sub_domain = f"{rr}.{domain}" if rr != "@" else domain
 
-    try:
-        request = dns_models.DescribeSubDomainRecordsRequest(sub_domain=sub_domain, type="AAAA")
-        resp = client.describe_sub_domain_records(request)
-        records = resp.body.domain_records.record if resp.body.domain_records else []
-    except Exception as e:
-        log.error(f"查询 DNS 解析失败: {e}")
+    success_all = True
+    if enable_ali:
+        if not ak_id or not ak_secret or not ali_domain:
+            log.error("[Aliyun] 启用但缺少必要配置参数！")
+            success_all = False
+        else:
+            if not sync_aliyun(ak_id, ak_secret, ali_domain, ali_rr, current_ipv6):
+                success_all = False
+
+    if enable_cf:
+        if not cf_token or not cf_domain:
+            log.error("[Cloudflare] 启用但缺少必要配置参数！")
+            success_all = False
+        else:
+            if not sync_cloudflare(cf_token, cf_domain, cf_rr, current_ipv6, proxied=cf_proxied):
+                success_all = False
+
+    if not success_all:
         sys.exit(1)
-
-    if records:
-        record = records[0]
-        if record.value == current_ipv6:
-            log.info(f"DNS 记录未发生改变 [{sub_domain} AAAA {current_ipv6}]，跳过更新")
-            return
-        log.info(f"更新解析: {sub_domain} AAAA {record.value} -> {current_ipv6}")
-        try:
-            update_req = dns_models.UpdateDomainRecordRequest(
-                record_id=record.record_id, rr=rr, type="AAAA", value=current_ipv6, ttl=TTL
-            )
-            client.update_domain_record(update_req)
-            log.info("DNS 更新成功 ✓")
-        except Exception as e:
-            log.error(f"更新失败: {e}")
-            sys.exit(1)
-    else:
-        log.info(f"创建解析: {sub_domain} AAAA {current_ipv6}")
-        try:
-            add_req = dns_models.AddDomainRecordRequest(
-                domain_name=domain, rr=rr, type="AAAA", value=current_ipv6, ttl=TTL
-            )
-            resp = client.add_domain_record(add_req)
-            log.info(f"DNS 创建成功 ✓ RecordId: {resp.body.record_id}")
-        except Exception as e:
-            log.error(f"创建失败: {e}")
-            sys.exit(1)
 
 if __name__ == "__main__":
     main()
